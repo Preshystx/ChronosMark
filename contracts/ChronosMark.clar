@@ -104,15 +104,23 @@
   )
 )
 
+(define-private (validate-expiry-date (expiry-date (optional uint)))
+  (match expiry-date
+    expiry (> expiry burn-block-height)  ;; Must be in the future
+    true  ;; None is valid (no expiration)
+  )
+)
+
+;; FIXED: Properly defined is-certificate-expired function
 (define-private (is-certificate-expired (certificate-id uint))
   (if (validate-certificate-id certificate-id)
     (let ((cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) false)))
       (match (get expiry-date cert)
-        expiry (< expiry burn-block-height)
-        false
+        expiry (>= burn-block-height expiry)  ;; Certificate is expired if current block >= expiry
+        false  ;; No expiry date means never expires
       )
     )
-    false
+    false  ;; Invalid certificate ID means not expired (but also not found)
   )
 )
 
@@ -204,6 +212,7 @@
   (let 
     (
       (certificate-id (var-get next-certificate-id))
+      (validated-expiry (if (is-some expiry-date) expiry-date none))
     )
     
     ;; Input validation
@@ -212,6 +221,7 @@
     (asserts! (validate-text-length cert-title u1 u128) err-invalid-title)
     (asserts! (validate-text-length cert-description u1 u512) err-invalid-description)
     (asserts! (validate-text-length metadata-uri u1 u256) err-invalid-description)
+    (asserts! (validate-expiry-date expiry-date) err-invalid-template)
     
     ;; Authorization checks
     (let 
@@ -240,7 +250,7 @@
           certificate-description: cert-description,
           metadata-uri: metadata-uri,
           issue-date: burn-block-height,
-          expiry-date: expiry-date,
+          expiry-date: validated-expiry,
           is-revoked: false,
           revocation-reason: none
         }
@@ -270,6 +280,7 @@
   (let 
     (
       (batch-size (len recipients))
+      (validated-expiry (if (is-some expiry-date) expiry-date none))
     )
     
     ;; Input validation
@@ -278,6 +289,7 @@
     (asserts! (validate-text-length cert-title u1 u128) err-invalid-title)
     (asserts! (validate-text-length cert-description u1 u512) err-invalid-description)
     (asserts! (validate-text-length metadata-uri u1 u256) err-invalid-description)
+    (asserts! (validate-expiry-date expiry-date) err-invalid-template)
     
     ;; Authorization checks
     (let 
