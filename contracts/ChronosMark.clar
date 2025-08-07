@@ -1,5 +1,5 @@
 ;; ChronosMark - Immutable Credentialing Across Lifetimes
-;; NFT-based certificate system with verifiable metadata and lifecycle management
+;; NFT-based certificate system with verifiable metadata, lifecycle management, and QR code integration
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -13,12 +13,14 @@
 (define-constant err-invalid-title (err u105))
 (define-constant err-invalid-description (err u106))
 (define-constant err-batch-limit-exceeded (err u107))
+(define-constant err-invalid-url (err u108))
 
 ;; NFT Definition
 (define-non-fungible-token chronos-certificate uint)
 
 ;; Data Variables
 (define-data-var next-certificate-id uint u1)
+(define-data-var next-template-id uint u1)
 (define-data-var max-batch-size uint u50)
 
 ;; Certificate Templates
@@ -33,8 +35,6 @@
   }
 )
 
-(define-data-var next-template-id uint u1)
-
 ;; Certificate Storage
 (define-map certificates
   { certificate-id: uint }
@@ -48,7 +48,8 @@
     issue-date: uint,
     expiry-date: (optional uint),
     is-revoked: bool,
-    revocation-reason: (optional (string-utf8 256))
+    revocation-reason: (optional (string-utf8 256)),
+    qr-verification-url: (optional (string-utf8 256))
   }
 )
 
@@ -73,6 +74,16 @@
 (define-map verification-stats
   { certificate-id: uint }
   { verification-count: uint }
+)
+
+;; QR Code Settings
+(define-map qr-verification-urls
+  { certificate-id: uint }
+  { 
+    verification-url: (string-utf8 256),
+    generated-at: uint,
+    generated-by: principal
+  }
 )
 
 ;; Private Functions
@@ -106,22 +117,122 @@
 
 (define-private (validate-expiry-date (expiry-date (optional uint)))
   (match expiry-date
-    expiry (> expiry burn-block-height)  ;; Must be in the future
+    expiry (> expiry stacks-block-height)  ;; Must be in the future
     true  ;; None is valid (no expiration)
   )
 )
 
-;; FIXED: Properly defined is-certificate-expired function
+(define-private (validate-url (url (string-utf8 256)))
+  (and 
+    (> (len url) u7)  ;; Minimum "http://" length
+    (or 
+      (is-eq (unwrap-panic (slice? url u0 u7)) u"http://")
+      (is-eq (unwrap-panic (slice? url u0 u8)) u"https://")
+    )
+  )
+)
+
 (define-private (is-certificate-expired (certificate-id uint))
   (if (validate-certificate-id certificate-id)
-    (let ((cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) false)))
-      (match (get expiry-date cert)
-        expiry (>= burn-block-height expiry)  ;; Certificate is expired if current block >= expiry
-        false  ;; No expiry date means never expires
+    (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
+      (match cert-option
+        cert (match (get expiry-date cert)
+          expiry (>= stacks-block-height expiry)  ;; Certificate is expired if current block >= expiry
+          false  ;; No expiry date means never expires
+        )
+        false  ;; Certificate not found means not expired (but also not found)
       )
     )
     false  ;; Invalid certificate ID means not expired (but also not found)
   )
+)
+
+;; Simple uint to string conversion for certificate IDs (supports up to 999999)
+(define-private (uint-to-string (value uint))
+  (if (is-eq value u0) u"0"
+    (if (< value u10) 
+      (if (is-eq value u1) u"1"
+        (if (is-eq value u2) u"2"
+          (if (is-eq value u3) u"3"
+            (if (is-eq value u4) u"4"
+              (if (is-eq value u5) u"5"
+                (if (is-eq value u6) u"6"
+                  (if (is-eq value u7) u"7"
+                    (if (is-eq value u8) u"8"
+                      u"9"))))))))
+      ;; For larger numbers, use a more comprehensive approach
+      (convert-large-uint-to-string value)
+    )
+  )
+)
+
+;; Helper function to convert larger uints to strings
+(define-private (convert-large-uint-to-string (value uint))
+  (let 
+    (
+      (ones (mod value u10))
+      (tens (mod (/ value u10) u10))
+      (hundreds (mod (/ value u100) u10))
+      (thousands (mod (/ value u1000) u10))
+      (ten-thousands (mod (/ value u10000) u10))
+      (hundred-thousands (mod (/ value u100000) u10))
+    )
+    (if (>= value u100000)
+      (concat 
+        (digit-to-char hundred-thousands)
+        (concat 
+          (digit-to-char ten-thousands)
+          (concat 
+            (digit-to-char thousands)
+            (concat 
+              (digit-to-char hundreds)
+              (concat 
+                (digit-to-char tens)
+                (digit-to-char ones))))))
+      (if (>= value u10000)
+        (concat 
+          (digit-to-char ten-thousands)
+          (concat 
+            (digit-to-char thousands)
+            (concat 
+              (digit-to-char hundreds)
+              (concat 
+                (digit-to-char tens)
+                (digit-to-char ones)))))
+        (if (>= value u1000)
+          (concat 
+            (digit-to-char thousands)
+            (concat 
+              (digit-to-char hundreds)
+              (concat 
+                (digit-to-char tens)
+                (digit-to-char ones))))
+          (if (>= value u100)
+            (concat 
+              (digit-to-char hundreds)
+              (concat 
+                (digit-to-char tens)
+                (digit-to-char ones)))
+            (if (>= value u10)
+              (concat 
+                (digit-to-char tens)
+                (digit-to-char ones))
+              (digit-to-char ones))))))
+  )
+)
+
+;; Convert a single digit (0-9) to its string representation
+(define-private (digit-to-char (digit uint))
+  (if (is-eq digit u0) u"0"
+    (if (is-eq digit u1) u"1"
+      (if (is-eq digit u2) u"2"
+        (if (is-eq digit u3) u"3"
+          (if (is-eq digit u4) u"4"
+            (if (is-eq digit u5) u"5"
+              (if (is-eq digit u6) u"6"
+                (if (is-eq digit u7) u"7"
+                  (if (is-eq digit u8) u"8"
+                    u"9")))))))))
 )
 
 ;; Authorization Functions
@@ -137,7 +248,7 @@
         organization-name: org-name,
         is-active: true,
         authorized-by: tx-sender,
-        authorization-date: burn-block-height
+        authorization-date: stacks-block-height
       }
     ))
   )
@@ -148,11 +259,14 @@
     (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
     (asserts! (validate-principal issuer) err-invalid-issuer)
     
-    (let ((issuer-info (unwrap! (map-get? authorized-issuers { issuer: issuer }) err-invalid-issuer)))
-      (ok (map-set authorized-issuers
-        { issuer: issuer }
-        (merge issuer-info { is-active: false })
-      ))
+    (let ((issuer-info-option (map-get? authorized-issuers { issuer: issuer })))
+      (asserts! (is-some issuer-info-option) err-invalid-issuer)
+      (let ((issuer-info (unwrap-panic issuer-info-option)))
+        (ok (map-set authorized-issuers
+          { issuer: issuer }
+          (merge issuer-info { is-active: false })
+        ))
+      )
     )
   )
 )
@@ -189,13 +303,16 @@
     (asserts! (validate-principal issuer) err-invalid-issuer)
     (asserts! (validate-template-id template-id) err-invalid-template)
     
-    (let ((template (unwrap! (map-get? certificate-templates { template-id: template-id }) err-invalid-template)))
-      (asserts! (is-eq tx-sender (get creator template)) err-not-authorized)
-      
-      (ok (map-set issuer-template-permissions
-        { issuer: issuer, template-id: template-id }
-        { can-issue: true }
-      ))
+    (let ((template-option (map-get? certificate-templates { template-id: template-id })))
+      (asserts! (is-some template-option) err-invalid-template)
+      (let ((template (unwrap-panic template-option)))
+        (asserts! (is-eq tx-sender (get creator template)) err-not-authorized)
+        
+        (ok (map-set issuer-template-permissions
+          { issuer: issuer, template-id: template-id }
+          { can-issue: true }
+        ))
+      )
     )
   )
 )
@@ -226,44 +343,99 @@
     ;; Authorization checks
     (let 
       (
-        (issuer-auth (unwrap! (map-get? authorized-issuers { issuer: tx-sender }) err-not-authorized))
-        (template (unwrap! (map-get? certificate-templates { template-id: template-id }) err-invalid-template))
+        (issuer-auth-option (map-get? authorized-issuers { issuer: tx-sender }))
+        (template-option (map-get? certificate-templates { template-id: template-id }))
         (permission (default-to { can-issue: false } 
           (map-get? issuer-template-permissions { issuer: tx-sender, template-id: template-id })))
       )
       
-      (asserts! (get is-active issuer-auth) err-not-authorized)
-      (asserts! (get is-active template) err-invalid-template)
-      (asserts! (get can-issue permission) err-not-authorized)
+      (asserts! (is-some issuer-auth-option) err-not-authorized)
+      (asserts! (is-some template-option) err-invalid-template)
       
-      ;; Mint NFT
-      (try! (nft-mint? chronos-certificate certificate-id recipient))
-      
-      ;; Store certificate data
-      (map-set certificates
-        { certificate-id: certificate-id }
-        {
-          issuer: tx-sender,
-          recipient: recipient,
-          template-id: template-id,
-          certificate-title: cert-title,
-          certificate-description: cert-description,
-          metadata-uri: metadata-uri,
-          issue-date: burn-block-height,
-          expiry-date: validated-expiry,
-          is-revoked: false,
-          revocation-reason: none
-        }
+      (let 
+        (
+          (issuer-auth (unwrap-panic issuer-auth-option))
+          (template (unwrap-panic template-option))
+        )
+        
+        (asserts! (get is-active issuer-auth) err-not-authorized)
+        (asserts! (get is-active template) err-invalid-template)
+        (asserts! (get can-issue permission) err-not-authorized)
+        
+        ;; Mint NFT
+        (try! (nft-mint? chronos-certificate certificate-id recipient))
+        
+        ;; Store certificate data
+        (map-set certificates
+          { certificate-id: certificate-id }
+          {
+            issuer: tx-sender,
+            recipient: recipient,
+            template-id: template-id,
+            certificate-title: cert-title,
+            certificate-description: cert-description,
+            metadata-uri: metadata-uri,
+            issue-date: stacks-block-height,
+            expiry-date: validated-expiry,
+            is-revoked: false,
+            revocation-reason: none,
+            qr-verification-url: none
+          }
+        )
+        
+        ;; Initialize verification stats
+        (map-set verification-stats
+          { certificate-id: certificate-id }
+          { verification-count: u0 }
+        )
+        
+        (var-set next-certificate-id (+ certificate-id u1))
+        (ok certificate-id)
       )
-      
-      ;; Initialize verification stats
-      (map-set verification-stats
-        { certificate-id: certificate-id }
-        { verification-count: u0 }
+    )
+  )
+)
+
+;; QR Code URL Generation - Fixed version
+(define-public (generate-qr-verification-url (certificate-id uint) (base-url (string-utf8 128)))
+  (begin
+    (asserts! (validate-certificate-id certificate-id) err-certificate-not-found)
+    (asserts! (validate-text-length base-url u8 u128) err-invalid-url)
+    
+    (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
+      (asserts! (is-some cert-option) err-certificate-not-found)
+      (let ((cert (unwrap-panic cert-option)))
+        ;; Only certificate owner or issuer can generate QR codes
+        (asserts! (or 
+          (is-eq tx-sender (get recipient cert))
+          (is-eq tx-sender (get issuer cert))
+        ) err-not-authorized)
+        
+        ;; Create verification URL using certificate ID
+        (let ((cert-id-str (uint-to-string certificate-id)))
+          (let ((verification-url (unwrap-panic (as-max-len? 
+            (concat (concat base-url u"/verify/") cert-id-str) u256))))
+            
+            ;; Store QR verification URL
+            (map-set qr-verification-urls
+              { certificate-id: certificate-id }
+              {
+                verification-url: verification-url,
+                generated-at: stacks-block-height,
+                generated-by: tx-sender
+              }
+            )
+            
+            ;; Update certificate with QR URL
+            (map-set certificates
+              { certificate-id: certificate-id }
+              (merge cert { qr-verification-url: (some verification-url) })
+            )
+            
+            (ok verification-url)
+          )
+        )
       )
-      
-      (var-set next-certificate-id (+ certificate-id u1))
-      (ok certificate-id)
     )
   )
 )
@@ -294,17 +466,27 @@
     ;; Authorization checks
     (let 
       (
-        (issuer-auth (unwrap! (map-get? authorized-issuers { issuer: tx-sender }) err-not-authorized))
-        (template (unwrap! (map-get? certificate-templates { template-id: template-id }) err-invalid-template))
+        (issuer-auth-option (map-get? authorized-issuers { issuer: tx-sender }))
+        (template-option (map-get? certificate-templates { template-id: template-id }))
         (permission (default-to { can-issue: false } 
           (map-get? issuer-template-permissions { issuer: tx-sender, template-id: template-id })))
       )
       
-      (asserts! (get is-active issuer-auth) err-not-authorized)
-      (asserts! (get is-active template) err-invalid-template)
-      (asserts! (get can-issue permission) err-not-authorized)
+      (asserts! (is-some issuer-auth-option) err-not-authorized)
+      (asserts! (is-some template-option) err-invalid-template)
       
-      (ok (map issue-certificate-for-recipient recipients))
+      (let 
+        (
+          (issuer-auth (unwrap-panic issuer-auth-option))
+          (template (unwrap-panic template-option))
+        )
+        
+        (asserts! (get is-active issuer-auth) err-not-authorized)
+        (asserts! (get is-active template) err-invalid-template)
+        (asserts! (get can-issue permission) err-not-authorized)
+        
+        (ok (map issue-certificate-for-recipient recipients))
+      )
     )
   )
 )
@@ -327,17 +509,20 @@
     (asserts! (validate-certificate-id certificate-id) err-certificate-not-found)
     (asserts! (validate-text-length reason u1 u256) err-invalid-description)
     
-    (let ((cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) err-certificate-not-found)))
-      (asserts! (is-eq tx-sender (get issuer cert)) err-not-authorized)
-      (asserts! (not (get is-revoked cert)) err-already-revoked)
-      
-      (ok (map-set certificates
-        { certificate-id: certificate-id }
-        (merge cert { 
-          is-revoked: true, 
-          revocation-reason: (some reason) 
-        })
-      ))
+    (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
+      (asserts! (is-some cert-option) err-certificate-not-found)
+      (let ((cert (unwrap-panic cert-option)))
+        (asserts! (is-eq tx-sender (get issuer cert)) err-not-authorized)
+        (asserts! (not (get is-revoked cert)) err-already-revoked)
+        
+        (ok (map-set certificates
+          { certificate-id: certificate-id }
+          (merge cert { 
+            is-revoked: true, 
+            revocation-reason: (some reason) 
+          })
+        ))
+      )
     )
   )
 )
@@ -349,24 +534,27 @@
     
     (let 
       (
-        (cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) err-certificate-not-found))
+        (cert-option (map-get? certificates { certificate-id: certificate-id }))
         (stats (default-to { verification-count: u0 } 
           (map-get? verification-stats { certificate-id: certificate-id })))
       )
       
-      ;; Update verification count
-      (map-set verification-stats
-        { certificate-id: certificate-id }
-        { verification-count: (+ (get verification-count stats) u1) }
+      (asserts! (is-some cert-option) err-certificate-not-found)
+      (let ((cert (unwrap-panic cert-option)))
+        ;; Update verification count
+        (map-set verification-stats
+          { certificate-id: certificate-id }
+          { verification-count: (+ (get verification-count stats) u1) }
+        )
+        
+        (ok {
+          is-valid: (and 
+            (not (get is-revoked cert))
+            (not (is-certificate-expired certificate-id))
+          ),
+          certificate: cert
+        })
       )
-      
-      (ok {
-        is-valid: (and 
-          (not (get is-revoked cert))
-          (not (is-certificate-expired certificate-id))
-        ),
-        certificate: cert
-      })
     )
   )
 )
@@ -400,6 +588,25 @@
   )
 )
 
+(define-read-only (get-qr-verification-url (certificate-id uint))
+  (if (validate-certificate-id certificate-id)
+    (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
+      (match cert-option
+        cert (get qr-verification-url cert)
+        none
+      )
+    )
+    none
+  )
+)
+
+(define-read-only (get-qr-url-info (certificate-id uint))
+  (if (validate-certificate-id certificate-id)
+    (map-get? qr-verification-urls { certificate-id: certificate-id })
+    none
+  )
+)
+
 (define-read-only (is-authorized-issuer (issuer principal))
   (if (validate-principal issuer)
     (match (map-get? authorized-issuers { issuer: issuer })
@@ -426,8 +633,11 @@
 
 (define-read-only (get-token-uri (certificate-id uint))
   (if (validate-certificate-id certificate-id)
-    (let ((cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) err-certificate-not-found)))
-      (ok (some (get metadata-uri cert)))
+    (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
+      (match cert-option
+        cert (ok (some (get metadata-uri cert)))
+        err-certificate-not-found
+      )
     )
     err-certificate-not-found
   )
@@ -440,14 +650,22 @@
   )
 )
 
-;; Certificate Transfer (simplified without trait)
+;; Certificate Transfer
 (define-public (transfer-certificate (certificate-id uint) (recipient principal))
   (begin
     (asserts! (validate-certificate-id certificate-id) err-certificate-not-found)
     (asserts! (validate-principal recipient) err-invalid-recipient)
     
-    (let ((cert (unwrap! (map-get? certificates { certificate-id: certificate-id }) err-certificate-not-found)))
-      (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? chronos-certificate certificate-id) err-not-authorized)) err-not-authorized)
+    (let 
+      (
+        (cert-option (map-get? certificates { certificate-id: certificate-id }))
+        (current-owner (nft-get-owner? chronos-certificate certificate-id))
+      )
+      
+      (asserts! (is-some cert-option) err-certificate-not-found)
+      (asserts! (is-some current-owner) err-certificate-not-found)
+      (asserts! (is-eq tx-sender (unwrap-panic current-owner)) err-not-authorized)
+      
       (try! (nft-transfer? chronos-certificate certificate-id tx-sender recipient))
       (ok true)
     )
