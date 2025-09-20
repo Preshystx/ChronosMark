@@ -1,5 +1,5 @@
 ;; ChronosMark - Immutable Credentialing Across Lifetimes
-;; NFT-based certificate system with verifiable metadata, lifecycle management, and QR code integration
+;; NFT-based certificate system with verifiable metadata, lifecycle management, QR code integration, and multi-signature issuance
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -14,6 +14,14 @@
 (define-constant err-invalid-description (err u106))
 (define-constant err-batch-limit-exceeded (err u107))
 (define-constant err-invalid-url (err u108))
+(define-constant err-proposal-not-found (err u109))
+(define-constant err-already-approved (err u110))
+(define-constant err-insufficient-approvals (err u111))
+(define-constant err-proposal-already-executed (err u112))
+(define-constant err-proposal-rejected (err u113))
+(define-constant err-invalid-threshold (err u114))
+(define-constant err-not-multisig-signer (err u115))
+(define-constant err-invalid-proposal-status (err u116))
 
 ;; NFT Definition
 (define-non-fungible-token chronos-certificate uint)
@@ -21,6 +29,7 @@
 ;; Data Variables
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-template-id uint u1)
+(define-data-var next-proposal-id uint u1)
 (define-data-var max-batch-size uint u50)
 
 ;; Certificate Templates
@@ -31,8 +40,15 @@
     template-name: (string-utf8 64),
     description: (string-utf8 256),
     metadata-schema: (string-utf8 512),
-    is-active: bool
+    is-active: bool,
+    requires-multisig: bool
   }
+)
+
+;; Template Approval Thresholds for Multi-Sig
+(define-map template-approval-thresholds
+  { template-id: uint }
+  { required-approvals: uint }
 )
 
 ;; Certificate Storage
@@ -49,7 +65,48 @@
     expiry-date: (optional uint),
     is-revoked: bool,
     revocation-reason: (optional (string-utf8 256)),
-    qr-verification-url: (optional (string-utf8 256))
+    qr-verification-url: (optional (string-utf8 256)),
+    is-multisig: bool
+  }
+)
+
+;; Multi-Signature Proposals
+(define-map multisig-proposals
+  { proposal-id: uint }
+  {
+    proposer: principal,
+    recipient: principal,
+    template-id: uint,
+    certificate-title: (string-utf8 128),
+    certificate-description: (string-utf8 512),
+    metadata-uri: (string-utf8 256),
+    expiry-date: (optional uint),
+    created-at: uint,
+    status: (string-utf8 16),
+    required-approvals: uint,
+    current-approvals: uint,
+    executed-at: (optional uint)
+  }
+)
+
+;; Proposal Approvals Tracking
+(define-map proposal-approvals
+  { proposal-id: uint, signer: principal }
+  { 
+    approved: bool,
+    approved-at: uint,
+    rejection-reason: (optional (string-utf8 256))
+  }
+)
+
+;; Multi-Signature Authorized Signers
+(define-map multisig-signers
+  { signer: principal }
+  {
+    authorized-by: principal,
+    role: (string-utf8 64),
+    is-active: bool,
+    authorized-at: uint
   }
 )
 
@@ -115,16 +172,23 @@
   )
 )
 
+(define-private (validate-proposal-id (proposal-id uint))
+  (and 
+    (> proposal-id u0)
+    (< proposal-id (var-get next-proposal-id))
+  )
+)
+
 (define-private (validate-expiry-date (expiry-date (optional uint)))
   (match expiry-date
-    expiry (> expiry stacks-block-height)  ;; Must be in the future
-    true  ;; None is valid (no expiration)
+    expiry (> expiry stacks-block-height)
+    true
   )
 )
 
 (define-private (validate-url (url (string-utf8 256)))
   (and 
-    (> (len url) u7)  ;; Minimum "http://" length
+    (> (len url) u7)
     (or 
       (is-eq (unwrap-panic (slice? url u0 u7)) u"http://")
       (is-eq (unwrap-panic (slice? url u0 u8)) u"https://")
@@ -137,17 +201,17 @@
     (let ((cert-option (map-get? certificates { certificate-id: certificate-id })))
       (match cert-option
         cert (match (get expiry-date cert)
-          expiry (>= stacks-block-height expiry)  ;; Certificate is expired if current block >= expiry
-          false  ;; No expiry date means never expires
+          expiry (>= stacks-block-height expiry)
+          false
         )
-        false  ;; Certificate not found means not expired (but also not found)
+        false
       )
     )
-    false  ;; Invalid certificate ID means not expired (but also not found)
+    false
   )
 )
 
-;; Simple uint to string conversion for certificate IDs (supports up to 999999)
+;; Simple uint to string conversion for certificate IDs
 (define-private (uint-to-string (value uint))
   (if (is-eq value u0) u"0"
     (if (< value u10) 
@@ -160,13 +224,11 @@
                   (if (is-eq value u7) u"7"
                     (if (is-eq value u8) u"8"
                       u"9"))))))))
-      ;; For larger numbers, use a more comprehensive approach
       (convert-large-uint-to-string value)
     )
   )
 )
 
-;; Helper function to convert larger uints to strings
 (define-private (convert-large-uint-to-string (value uint))
   (let 
     (
@@ -221,7 +283,6 @@
   )
 )
 
-;; Convert a single digit (0-9) to its string representation
 (define-private (digit-to-char (digit uint))
   (if (is-eq digit u0) u"0"
     (if (is-eq digit u1) u"1"
@@ -271,11 +332,48 @@
   )
 )
 
+;; Multi-Signature Signer Management
+(define-public (add-multisig-signer (signer principal) (role (string-utf8 64)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (validate-principal signer) err-invalid-issuer)
+    (asserts! (validate-text-length role u1 u64) err-invalid-title)
+    
+    (ok (map-set multisig-signers
+      { signer: signer }
+      {
+        authorized-by: tx-sender,
+        role: role,
+        is-active: true,
+        authorized-at: stacks-block-height
+      }
+    ))
+  )
+)
+
+(define-public (revoke-multisig-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (validate-principal signer) err-invalid-issuer)
+    
+    (let ((signer-info-option (map-get? multisig-signers { signer: signer })))
+      (asserts! (is-some signer-info-option) err-not-multisig-signer)
+      (let ((signer-info (unwrap-panic signer-info-option)))
+        (ok (map-set multisig-signers
+          { signer: signer }
+          (merge signer-info { is-active: false })
+        ))
+      )
+    )
+  )
+)
+
 ;; Template Management
 (define-public (create-certificate-template 
   (template-name (string-utf8 64))
   (description (string-utf8 256))
   (metadata-schema (string-utf8 512))
+  (requires-multisig bool)
 )
   (let ((template-id (var-get next-template-id)))
     (asserts! (validate-text-length template-name u1 u64) err-invalid-title)
@@ -289,12 +387,34 @@
         template-name: template-name,
         description: description,
         metadata-schema: metadata-schema,
-        is-active: true
+        is-active: true,
+        requires-multisig: requires-multisig
       }
     )
     
     (var-set next-template-id (+ template-id u1))
     (ok template-id)
+  )
+)
+
+(define-public (set-template-approval-threshold (template-id uint) (threshold uint))
+  (begin
+    (asserts! (validate-template-id template-id) err-invalid-template)
+    (asserts! (validate-uint threshold) err-invalid-threshold)
+    (asserts! (<= threshold u10) err-invalid-threshold)
+    
+    (let ((template-option (map-get? certificate-templates { template-id: template-id })))
+      (asserts! (is-some template-option) err-invalid-template)
+      (let ((template (unwrap-panic template-option)))
+        (asserts! (is-eq tx-sender (get creator template)) err-not-authorized)
+        (asserts! (get requires-multisig template) err-invalid-template)
+        
+        (ok (map-set template-approval-thresholds
+          { template-id: template-id }
+          { required-approvals: threshold }
+        ))
+      )
+    )
   )
 )
 
@@ -317,7 +437,235 @@
   )
 )
 
-;; Certificate Issuance
+;; Multi-Signature Proposal Functions
+(define-public (create-multisig-proposal
+  (recipient principal)
+  (template-id uint)
+  (cert-title (string-utf8 128))
+  (cert-description (string-utf8 512))
+  (metadata-uri (string-utf8 256))
+  (expiry-date (optional uint))
+)
+  (let 
+    (
+      (proposal-id (var-get next-proposal-id))
+      (validated-expiry (if (is-some expiry-date) expiry-date none))
+    )
+    
+    ;; Input validation
+    (asserts! (validate-principal recipient) err-invalid-recipient)
+    (asserts! (validate-template-id template-id) err-invalid-template)
+    (asserts! (validate-text-length cert-title u1 u128) err-invalid-title)
+    (asserts! (validate-text-length cert-description u1 u512) err-invalid-description)
+    (asserts! (validate-text-length metadata-uri u1 u256) err-invalid-description)
+    (asserts! (validate-expiry-date expiry-date) err-invalid-template)
+    
+    ;; Check template requires multi-sig and get threshold
+    (let 
+      (
+        (template-option (map-get? certificate-templates { template-id: template-id }))
+        (threshold-option (map-get? template-approval-thresholds { template-id: template-id }))
+        (issuer-auth-option (map-get? authorized-issuers { issuer: tx-sender }))
+        (permission (default-to { can-issue: false } 
+          (map-get? issuer-template-permissions { issuer: tx-sender, template-id: template-id })))
+      )
+      
+      (asserts! (is-some template-option) err-invalid-template)
+      (asserts! (is-some issuer-auth-option) err-not-authorized)
+      (asserts! (is-some threshold-option) err-invalid-threshold)
+      
+      (let 
+        (
+          (template (unwrap-panic template-option))
+          (threshold (unwrap-panic threshold-option))
+          (issuer-auth (unwrap-panic issuer-auth-option))
+        )
+        
+        (asserts! (get is-active template) err-invalid-template)
+        (asserts! (get requires-multisig template) err-invalid-template)
+        (asserts! (get is-active issuer-auth) err-not-authorized)
+        (asserts! (get can-issue permission) err-not-authorized)
+        
+        ;; Create proposal
+        (map-set multisig-proposals
+          { proposal-id: proposal-id }
+          {
+            proposer: tx-sender,
+            recipient: recipient,
+            template-id: template-id,
+            certificate-title: cert-title,
+            certificate-description: cert-description,
+            metadata-uri: metadata-uri,
+            expiry-date: validated-expiry,
+            created-at: stacks-block-height,
+            status: u"pending",
+            required-approvals: (get required-approvals threshold),
+            current-approvals: u0,
+            executed-at: none
+          }
+        )
+        
+        (var-set next-proposal-id (+ proposal-id u1))
+        (ok proposal-id)
+      )
+    )
+  )
+)
+
+(define-public (approve-multisig-proposal (proposal-id uint))
+  (begin
+    (asserts! (validate-proposal-id proposal-id) err-proposal-not-found)
+    
+    (let 
+      (
+        (proposal-option (map-get? multisig-proposals { proposal-id: proposal-id }))
+        (signer-option (map-get? multisig-signers { signer: tx-sender }))
+        (existing-approval (map-get? proposal-approvals { proposal-id: proposal-id, signer: tx-sender }))
+      )
+      
+      (asserts! (is-some proposal-option) err-proposal-not-found)
+      (asserts! (is-some signer-option) err-not-multisig-signer)
+      (asserts! (is-none existing-approval) err-already-approved)
+      
+      (let 
+        (
+          (proposal (unwrap-panic proposal-option))
+          (signer-info (unwrap-panic signer-option))
+        )
+        
+        (asserts! (get is-active signer-info) err-not-multisig-signer)
+        (asserts! (is-eq (get status proposal) u"pending") err-invalid-proposal-status)
+        
+        ;; Record approval
+        (map-set proposal-approvals
+          { proposal-id: proposal-id, signer: tx-sender }
+          {
+            approved: true,
+            approved-at: stacks-block-height,
+            rejection-reason: none
+          }
+        )
+        
+        ;; Update proposal approval count
+        (let ((updated-approvals (+ (get current-approvals proposal) u1)))
+          (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { current-approvals: updated-approvals })
+          )
+          
+          (ok updated-approvals)
+        )
+      )
+    )
+  )
+)
+
+(define-public (reject-multisig-proposal (proposal-id uint) (reason (string-utf8 256)))
+  (begin
+    (asserts! (validate-proposal-id proposal-id) err-proposal-not-found)
+    (asserts! (validate-text-length reason u1 u256) err-invalid-description)
+    
+    (let 
+      (
+        (proposal-option (map-get? multisig-proposals { proposal-id: proposal-id }))
+        (signer-option (map-get? multisig-signers { signer: tx-sender }))
+        (existing-approval (map-get? proposal-approvals { proposal-id: proposal-id, signer: tx-sender }))
+      )
+      
+      (asserts! (is-some proposal-option) err-proposal-not-found)
+      (asserts! (is-some signer-option) err-not-multisig-signer)
+      (asserts! (is-none existing-approval) err-already-approved)
+      
+      (let 
+        (
+          (proposal (unwrap-panic proposal-option))
+          (signer-info (unwrap-panic signer-option))
+        )
+        
+        (asserts! (get is-active signer-info) err-not-multisig-signer)
+        (asserts! (is-eq (get status proposal) u"pending") err-invalid-proposal-status)
+        
+        ;; Record rejection
+        (map-set proposal-approvals
+          { proposal-id: proposal-id, signer: tx-sender }
+          {
+            approved: false,
+            approved-at: stacks-block-height,
+            rejection-reason: (some reason)
+          }
+        )
+        
+        ;; Update proposal status to rejected
+        (map-set multisig-proposals
+          { proposal-id: proposal-id }
+          (merge proposal { status: u"rejected" })
+        )
+        
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (execute-multisig-proposal (proposal-id uint))
+  (begin
+    (asserts! (validate-proposal-id proposal-id) err-proposal-not-found)
+    
+    (let ((proposal-option (map-get? multisig-proposals { proposal-id: proposal-id })))
+      (asserts! (is-some proposal-option) err-proposal-not-found)
+      
+      (let ((proposal (unwrap-panic proposal-option)))
+        (asserts! (is-eq (get status proposal) u"pending") err-invalid-proposal-status)
+        (asserts! (>= (get current-approvals proposal) (get required-approvals proposal)) err-insufficient-approvals)
+        
+        ;; Create certificate
+        (let ((certificate-id (var-get next-certificate-id)))
+          ;; Mint NFT
+          (try! (nft-mint? chronos-certificate certificate-id (get recipient proposal)))
+          
+          ;; Store certificate data
+          (map-set certificates
+            { certificate-id: certificate-id }
+            {
+              issuer: (get proposer proposal),
+              recipient: (get recipient proposal),
+              template-id: (get template-id proposal),
+              certificate-title: (get certificate-title proposal),
+              certificate-description: (get certificate-description proposal),
+              metadata-uri: (get metadata-uri proposal),
+              issue-date: stacks-block-height,
+              expiry-date: (get expiry-date proposal),
+              is-revoked: false,
+              revocation-reason: none,
+              qr-verification-url: none,
+              is-multisig: true
+            }
+          )
+          
+          ;; Initialize verification stats
+          (map-set verification-stats
+            { certificate-id: certificate-id }
+            { verification-count: u0 }
+          )
+          
+          ;; Update proposal status
+          (map-set multisig-proposals
+            { proposal-id: proposal-id }
+            (merge proposal { 
+              status: u"executed",
+              executed-at: (some stacks-block-height)
+            })
+          )
+          
+          (var-set next-certificate-id (+ certificate-id u1))
+          (ok certificate-id)
+        )
+      )
+    )
+  )
+)
+
+;; Standard Certificate Issuance (for non-multisig templates)
 (define-public (issue-certificate
   (recipient principal)
   (template-id uint)
@@ -360,6 +708,7 @@
         
         (asserts! (get is-active issuer-auth) err-not-authorized)
         (asserts! (get is-active template) err-invalid-template)
+        (asserts! (not (get requires-multisig template)) err-invalid-template)
         (asserts! (get can-issue permission) err-not-authorized)
         
         ;; Mint NFT
@@ -379,7 +728,8 @@
             expiry-date: validated-expiry,
             is-revoked: false,
             revocation-reason: none,
-            qr-verification-url: none
+            qr-verification-url: none,
+            is-multisig: false
           }
         )
         
@@ -396,7 +746,7 @@
   )
 )
 
-;; QR Code URL Generation - Fixed version
+;; QR Code URL Generation
 (define-public (generate-qr-verification-url (certificate-id uint) (base-url (string-utf8 128)))
   (begin
     (asserts! (validate-certificate-id certificate-id) err-certificate-not-found)
@@ -440,7 +790,7 @@
   )
 )
 
-;; Batch Certificate Issuance
+;; Batch Certificate Issuance (for non-multisig templates)
 (define-public (batch-issue-certificates
   (recipients (list 50 principal))
   (template-id uint)
@@ -483,6 +833,7 @@
         
         (asserts! (get is-active issuer-auth) err-not-authorized)
         (asserts! (get is-active template) err-invalid-template)
+        (asserts! (not (get requires-multisig template)) err-invalid-template)
         (asserts! (get can-issue permission) err-not-authorized)
         
         (ok (map issue-certificate-for-recipient recipients))
@@ -498,7 +849,7 @@
         (var-set next-certificate-id (+ certificate-id u1))
         certificate-id
       )
-      u0  ;; Return 0 for invalid recipients
+      u0
     )
   )
 )
@@ -564,6 +915,40 @@
   (if (validate-certificate-id certificate-id)
     (map-get? certificates { certificate-id: certificate-id })
     none
+  )
+)
+
+(define-read-only (get-multisig-proposal (proposal-id uint))
+  (if (validate-proposal-id proposal-id)
+    (map-get? multisig-proposals { proposal-id: proposal-id })
+    none
+  )
+)
+
+(define-read-only (get-proposal-approval (proposal-id uint) (signer principal))
+  (if (and (validate-proposal-id proposal-id) (validate-principal signer))
+    (map-get? proposal-approvals { proposal-id: proposal-id, signer: signer })
+    none
+  )
+)
+
+(define-read-only (get-template-threshold (template-id uint))
+  (if (validate-template-id template-id)
+    (match (map-get? template-approval-thresholds { template-id: template-id })
+      threshold (some (get required-approvals threshold))
+      none
+    )
+    none
+  )
+)
+
+(define-read-only (is-authorized-multisig-signer (signer principal))
+  (if (validate-principal signer)
+    (match (map-get? multisig-signers { signer: signer })
+      signer-info (get is-active signer-info)
+      false
+    )
+    false
   )
 )
 
